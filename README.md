@@ -25,11 +25,24 @@ Same task as `cat_dog_project`, but compares **3 pre-trained encoders**:
   20 unseen images, and saves `features_<Model>.pkl` + `compare_results.pkl`.
 - `app.py`: the Streamlit comparison website.
 
-## Run
+## Run locally (for others)
+
+Requires only Python 3.9+ — one command sets up everything:
+
+```bash
+git clone https://github.com/Mikafar/cat-dog-cbir-compare.git
+cd cat-dog-cbir-compare
+python start_site.py                 # creates .venv, installs deps, starts site on :8502
+python start_site.py 8503            # optionally pick a different port
+```
+
+(On Windows, use `py start_site.py`.) First run downloads torch + model weights.
+
+## Developer run
 
 ```bash
 cd ~/PycharmProjects/cat_dog_project_compare
-.venv/bin/streamlit run app.py          # website on http://localhost:8501
+.venv/bin/streamlit run app.py          # website on http://localhost:8502
 .venv/bin/python encode_and_compare.py  # rebuild features + KNN + evaluation
 ```
 
