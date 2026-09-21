@@ -16,32 +16,8 @@ DIM = {"ResNet50": 2048, "VGG16": 4096, "DenseNet121": 1024}
 
 
 # --------------------------------------------------
-# 載入模型與特徵資料庫
+# 載入特徵資料庫 (不做 torch 推論)
 # --------------------------------------------------
-@st.cache_resource
-def load_encoders():
-    device = torch.device("mps" if torch.backends.mps.is_available() else
-                          "cuda" if torch.cuda.is_available() else "cpu")
-
-    def build(name):
-        net = getattr(models, name.lower())(weights="DEFAULT")
-        if name.lower().startswith("resnet"):
-            enc = torch.nn.Sequential(*list(net.children())[:-1], torch.nn.Flatten())
-        elif name.lower().startswith("vgg"):
-            enc = torch.nn.Sequential(*list(net.children())[:-1], torch.nn.Flatten(),
-                                      *list(net.classifier.children())[:-1])
-        elif name.lower().startswith("densenet"):
-            enc = torch.nn.Sequential(*list(net.children())[:-1],
-                                      torch.nn.AdaptiveAvgPool2d((1, 1)), torch.nn.Flatten())
-        else:
-            enc = torch.nn.Sequential(*list(net.children())[:-1], torch.nn.Flatten())
-        enc = enc.to(device)
-        enc.eval()
-        return enc
-
-    return {name: build(name) for name in MODELS}, device
-
-
 @st.cache_data
 def load_results():
     with open("compare_results.pkl", "rb") as f:
@@ -56,22 +32,61 @@ def load_distance_results():
     }
 
 
-encoders, device = load_encoders()
 results = load_results()
 dres = load_distance_results()
 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+# --------------------------------------------------
+# 惰性載入單一編碼器 (只有「上傳圖片」才會用到)
+# --------------------------------------------------
+@st.cache_resource
+def load_encoder(name):
+    device = torch.device("mps" if torch.backends.mps.is_available() else
+                          "cuda" if torch.cuda.is_available() else "cpu")
+    net = getattr(models, name.lower())(weights="DEFAULT")
+    if name.lower().startswith("resnet"):
+        enc = torch.nn.Sequential(*list(net.children())[:-1], torch.nn.Flatten())
+    elif name.lower().startswith("vgg"):
+        enc = torch.nn.Sequential(*list(net.children())[:-1], torch.nn.Flatten(),
+                                  *list(net.classifier.children())[:-1])
+    elif name.lower().startswith("densenet"):
+        enc = torch.nn.Sequential(*list(net.children())[:-1],
+                                  torch.nn.AdaptiveAvgPool2d((1, 1)), torch.nn.Flatten())
+    else:
+        enc = torch.nn.Sequential(*list(net.children())[:-1], torch.nn.Flatten())
+    enc = enc.to(device)
+    enc.eval()
+    return enc, device
 
 
-def extract_single_feature(image, enc):
-    tensor = transform(image.convert('RGB')).unsqueeze(0).to(device)
+_transform = None
+
+
+def get_transform():
+    global _transform
+    if _transform is None:
+        _transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    return _transform
+
+
+def extract_single_feature(image, name):
+    enc, device = load_encoder(name)
+    tensor = get_transform()(image.convert('RGB')).unsqueeze(0).to(device)
     with torch.no_grad():
         feat = enc(tensor).squeeze().cpu().numpy()
     return feat / np.linalg.norm(feat)
+
+
+def classify_and_top5(feat, name):
+    """回傳 pred, proba, top5 idx, bot5 idx, sims (全部只用已存特徵，不需 torch)"""
+    sims = cosine_similarity([feat], results[name]['train_features'])[0]
+    sorted_idx = np.argsort(sims)[::-1]
+    pred = results[name]['knn'].predict([feat])[0]
+    proba = results[name]['knn'].predict_proba([feat])[0]
+    return pred, proba, sorted_idx[:5], sorted_idx[-5:][::-1], sims
 
 
 # --------------------------------------------------
@@ -92,7 +107,7 @@ st.markdown(rows)
 st.info(f"**最佳模型**: {best} — 未見圖片準確率最高且訓練集最準確。")
 
 tab1, tab2, tab3 = st.tabs(["🔍 查詢圖片：Top-5 相似/不相似 (三模型比較)",
-                            "📊 20 張未見圖片測試與失敗案例 (三模型比較)",
+                            "📊 未見圖片測試與失敗案例 (三模型比較)",
                             "📏 距離計算比較 (Cosine / Euclidean / Manhattan)"])
 
 # --------------------------------------------------
@@ -103,8 +118,8 @@ with tab1:
     with c_s:
         if st.button("🎲 使用一張範例查詢圖片"):
             import glob
-            st.session_state['sample_query'] = Image.open(
-                np.random.choice(sorted(glob.glob("dataset/*/*"))))
+            st.session_state['sample_path'] = np.random.choice(
+                sorted(glob.glob("dataset/*/*")))
             if 'uploaded_query' in st.session_state:
                 del st.session_state['uploaded_query']
     with c_u:
@@ -112,33 +127,28 @@ with tab1:
                                     key="q_up")
     if uploaded is not None:
         st.session_state['uploaded_query'] = Image.open(uploaded)
-        if 'sample_query' in st.session_state:
-            del st.session_state['sample_query']
+        if 'sample_path' in st.session_state:
+            del st.session_state['sample_path']
 
-    query_img = st.session_state.get('uploaded_query') or st.session_state.get('sample_query')
+    is_sample = 'sample_path' in st.session_state and 'uploaded_query' not in st.session_state
+    is_upload = 'uploaded_query' in st.session_state
 
-    if query_img is not None:
-        is_sample = 'sample_query' in st.session_state and 'uploaded_query' not in st.session_state
+    if is_sample:
+        # 範例圖片就是資料庫圖片 → 直接用已存特徵，不需 torch
+        samp_path = st.session_state['sample_path']
+        samp_img = Image.open(samp_path)
         qc, rc = st.columns([1, 2])
         with qc:
-            st.image(query_img, caption="範例查詢 (Sample)" if is_sample else "上傳的 Query Image",
-                     width="stretch")
-
+            st.image(samp_img, caption="範例查詢 (Sample)", width="stretch")
         for name in MODELS:
+            db_i = results[name]['train_paths'].index(samp_path)
+            feat = results[name]['train_features'][db_i]
+            pred, proba, top5, bot5, sims = classify_and_top5(feat, name)
             st.divider()
             st.subheader(f"🔷 {name} (dim={DIM[name]})")
-            feat = extract_single_feature(query_img, encoders[name])
-
-            pred = results[name]['knn'].predict([feat])[0]
-            proba = results[name]['knn'].predict_proba([feat])[0]
             label_text = "🐱 貓" if pred == 0 else "🐶 狗"
-            st.success(f"**KNN 分類 ({name})**：{label_text}  (貓 {proba[0]*100:.1f}% | 狗 {proba[1]*100:.1f}%)")
-
-            sims = cosine_similarity([feat], results[name]['train_features'])[0]
-            sorted_idx = np.argsort(sims)[::-1]
-            top5 = sorted_idx[:5]
-            bot5 = sorted_idx[-5:][::-1]
-
+            st.success(f"**KNN 分類 ({name})**：{label_text}  (貓 {proba[0]*100:.1f}% | 狗 {proba[1]*100:.1f}%)"
+                       + (" ✅ (資料庫內圖片)" if db_i < len(results[name]['train_labels']) else ""))
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("**🔥 Top 5 最相似**")
@@ -154,9 +164,38 @@ with tab1:
                     with cols[i]:
                         st.image(results[name]['train_paths'][idx], width="stretch")
                         st.caption(f"{sims[idx]:.3f}\n{'貓' if results[name]['train_labels'][idx]==0 else '狗'}")
+    elif is_upload:
+        qimg = st.session_state['uploaded_query']
+        qc, rc = st.columns([1, 2])
+        with qc:
+            st.image(qimg, caption="上傳的 Query Image", width="stretch")
+        for name in MODELS:
+            feat = extract_single_feature(qimg, name)
+            pred, proba, top5, bot5, sims = classify_and_top5(feat, name)
+            st.divider()
+            st.subheader(f"🔷 {name} (dim={DIM[name]})")
+            label_text = "🐱 貓" if pred == 0 else "🐶 狗"
+            st.success(f"**KNN 分類 ({name})**：{label_text}  (貓 {proba[0]*100:.1f}% | 狗 {proba[1]*100:.1f}%)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**🔥 Top 5 最相似**")
+                cols = st.columns(5)
+                for i, idx in enumerate(top5):
+                    with cols[i]:
+                        st.image(results[name]['train_paths'][idx], width="stretch")
+                        st.caption(f"{sims[idx]:.3f}\n{'貓' if results[name]['train_labels'][idx]==0 else '狗'}")
+            with c2:
+                st.markdown("**❄️ Top 5 最不相似**")
+                cols = st.columns(5)
+                for i, idx in enumerate(bot5):
+                    with cols[i]:
+                        st.image(results[name]['train_paths'][idx], width="stretch")
+                        st.caption(f"{sims[idx]:.3f}\n{'貓' if results[name]['train_labels'][idx]==0 else '狗'}")
+    else:
+        st.info("👆 點 **🎲 使用一張範例查詢圖片**，或上傳一張貓／狗的圖片。")
 
 # --------------------------------------------------
-# TAB 2: unseen test across 3 models
+# TAB 2: unseen test across 3 models (用已存特徵，不需 torch)
 # --------------------------------------------------
 with tab2:
     rng_state = st.session_state.get("rng", None)
@@ -182,16 +221,18 @@ with tab2:
                          rng_state.choice(dog_idx, 5, replace=False).tolist())
             st.session_state['sel'] = sel
 
-    test_paths = [all_test[i] for i in st.session_state['sel']]
+    test_idx = st.session_state['sel']
 
+    # 預測值直接從已存 test_features 取得 (索引對應 original test pool)
     st.markdown("#### ✅ 各模型預測結果")
     cols = st.columns(5)
-    for col_i, (path, true_label) in enumerate(test_paths):
+    for col_i, i in enumerate(test_idx):
+        path, true_label = all_test[i]
         img = Image.open(path).convert('RGB')
         preds = []
         for name in MODELS:
-            feat = extract_single_feature(img, encoders[name])
-            preds.append(int(results[name]['knn'].predict([feat])[0]))
+            tf = results[name]['test_features'][i]
+            preds.append(int(results[name]['knn'].predict([tf])[0]))
         with cols[col_i % 5]:
             st.image(img, width="stretch")
             st.caption(f"真實: {'貓' if true_label==0 else '狗'}")
@@ -204,11 +245,11 @@ with tab2:
     st.divider()
     st.subheader("⚠️ 失敗案例 (Failed Cases)")
     all_correct = True
-    for path, true_label in test_paths:
-        img = Image.open(path).convert('RGB')
+    for i in test_idx:
+        path, true_label = all_test[i]
         for name in MODELS:
-            feat = extract_single_feature(img, encoders[name])
-            if int(results[name]['knn'].predict([feat])[0]) != true_label:
+            tf = results[name]['test_features'][i]
+            if int(results[name]['knn'].predict([tf])[0]) != true_label:
                 all_correct = False
                 st.error(f"{name} 錯判 {os.path.basename(path)} "
                          f"(真實: {'貓' if true_label==0 else '狗'})")
