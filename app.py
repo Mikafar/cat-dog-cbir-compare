@@ -159,31 +159,52 @@ with tab1:
 # TAB 2: unseen test across 3 models
 # --------------------------------------------------
 with tab2:
-    st.subheader("20 張未見圖片測試 — 三模型準確率比較")
-    test_paths = results['ResNet50']['test_paths']
+    rng_state = st.session_state.get("rng", None)
+    all_test = results['ResNet50']['test_paths']
+    cat_idx = [i for i, (_, lb) in enumerate(all_test) if lb == 0]
+    dog_idx = [i for i, (_, lb) in enumerate(all_test) if lb == 1]
+
+    if rng_state is None or 'sel' not in st.session_state:
+        rng_state = np.random.RandomState()
+        st.session_state['rng'] = rng_state
+    asample = st.session_state.get('sel', None)
+    if asample is None:
+        sel = sorted(rng_state.choice(cat_idx, 5, replace=False).tolist() +
+                     rng_state.choice(dog_idx, 5, replace=False).tolist())
+        st.session_state['sel'] = sel
+
+    top = st.columns([2, 1])
+    with top[0]:
+        st.subheader("🎯 未見圖片測試（抽樣 10 張：5 貓 + 5 狗）— 三模型比較")
+    with top[1]:
+        if st.button("🎲 重新抽 10 張"):
+            sel = sorted(rng_state.choice(cat_idx, 5, replace=False).tolist() +
+                         rng_state.choice(dog_idx, 5, replace=False).tolist())
+            st.session_state['sel'] = sel
+
+    test_paths = [all_test[i] for i in st.session_state['sel']]
 
     st.markdown("#### ✅ 各模型預測結果")
-    conf = {"TP": 0, "FP": 0, "TN": 0, "FN": 0}
     cols = st.columns(5)
-    for i, (path, true_label) in enumerate(test_paths):
+    for col_i, (path, true_label) in enumerate(test_paths):
         img = Image.open(path).convert('RGB')
         preds = []
         for name in MODELS:
             feat = extract_single_feature(img, encoders[name])
             preds.append(int(results[name]['knn'].predict([feat])[0]))
-        with cols[i % 5]:
+        with cols[col_i % 5]:
             st.image(img, width="stretch")
             st.caption(f"真實: {'貓' if true_label==0 else '狗'}")
             for name, p in zip(MODELS, preds):
                 ok = "✅" if p == true_label else "❌"
                 st.caption(f"{name}: {'貓' if p==0 else '狗'} {ok}")
-        if i == 4:
+        if col_i % 5 == 4:
             st.divider()
 
     st.divider()
     st.subheader("⚠️ 失敗案例 (Failed Cases)")
     all_correct = True
-    for i, (path, true_label) in enumerate(test_paths):
+    for path, true_label in test_paths:
         img = Image.open(path).convert('RGB')
         for name in MODELS:
             feat = extract_single_feature(img, encoders[name])
@@ -193,7 +214,7 @@ with tab2:
                          f"(真實: {'貓' if true_label==0 else '狗'})")
     if all_correct:
         st.balloons()
-        st.success("🎉 全部 20 張 × 3 模型 = 60 次分類皆正確！")
+        st.success("🎉 抽出的 10 張 × 3 模型 = 30 次分類皆正確！")
     else:
         st.markdown("""
         **失敗原因分析：**
