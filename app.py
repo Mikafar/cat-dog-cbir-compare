@@ -48,8 +48,17 @@ def load_results():
         return pickle.load(f)
 
 
+@st.cache_data
+def load_distance_results():
+    return {
+        "summary": pickle.load(open("distance_compare_results.pkl", "rb")),
+        "margins": pickle.load(open("distance_margins.pkl", "rb")),
+    }
+
+
 encoders, device = load_encoders()
 results = load_results()
+dres = load_distance_results()
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -82,8 +91,9 @@ for name in MODELS:
 st.markdown(rows)
 st.info(f"**最佳模型**: {best} — 未見圖片準確率最高且訓練集最準確。")
 
-tab1, tab2 = st.tabs(["🔍 查詢圖片：Top-5 相似/不相似 (三模型比較)",
-                      "📊 20 張未見圖片測試與失敗案例 (三模型比較)"])
+tab1, tab2, tab3 = st.tabs(["🔍 查詢圖片：Top-5 相似/不相似 (三模型比較)",
+                            "📊 20 張未見圖片測試與失敗案例 (三模型比較)",
+                            "📏 距離計算比較 (Cosine / Euclidean / Manhattan)"])
 
 # --------------------------------------------------
 # TAB 1: query image across 3 models
@@ -191,3 +201,65 @@ with tab2:
         2. **極端視角**：特寫／遠景失去判別訊號。
         3. **相似外型**：長毛小型犬與貓咪特徵重疊。
         """)
+
+# --------------------------------------------------
+# TAB 3: distance metric comparison
+# --------------------------------------------------
+with tab3:
+    st.subheader("📏 三種距離計算的比較 (kNN = 5, 特徵皆已 L2 正規化)")
+    st.info("""
+    **背景說明**：因為所有特徵向量都做了 L2 正規化 (長度=1)，在數學上
+    `Euclidean²(v,u) = 2 - 2·cos(v,u)`，所以 **Euclidean 與 Cosine 的排序
+    完全等價** —— 這就是為什麼兩者結果幾乎完全相同。
+    """)
+
+    dm = dres['summary']
+    st.markdown("#### 🔢 Accuracy 比較")
+    hdr = "| 編碼器 | 距離 | LOOCV 準確率 (320) | 未見 20 張準確率 |"
+    lines = [hdr, "|---|---|---|---|"]
+    for enc in MODELS:
+        for m, v in dm[enc].items():
+            lines.append(f"| {enc} | **{m}** | {v['loocv']:.2%} | {v['unseen']:.2%} |")
+    lines.append("")
+    st.markdown("\n".join(lines))
+
+    st.divider()
+    st.markdown("#### 📐 Margin 分析 (未見圖片：最近同類距離 vs 最近異類距離)")
+
+    marg = dres['margins']
+    rows = "| 編碼器 | 距離 | Mean margin | 有風險(<0) | Mean d_same | Mean d_opp |\n|---|---|---|---|---|---|"
+    for k, v in marg.items():
+        enc, m = k
+        if enc not in MODELS:
+            continue
+        rows += (f"\n| {enc} | **{m}** | {v['margin'].mean():+.4f} | {int((v['margin'] < 0).sum())}/20 "
+                 f"| {v['d_same'].mean():.4f} | {v['d_opp'].mean():.4f} |")
+    st.markdown(rows)
+
+    st.divider()
+    st.markdown("#### ⚖️ 優缺點分析 (Strength & Weakness)")
+
+    st.markdown("""
+    **1️⃣ Cosine Similarity 🟢**
+    - **優點**：對「整體亮暗／對比度縮放」不敏感，只看特徵的方向；是高維特徵
+      檢索 (CBIR) 最常用的指標。
+    - **缺點**：忽略向量的大小 (magnitude)，若兩個影像只有「強度」差異會被視為相同；
+      在高維空間中所有向量彼此趨近 (距離集中效應)，解析度較低。
+
+    **2️⃣ Euclidean (L2) 🟡**
+    - **優點**：保留完整的幾何距離資訊，直觀好理解 (真正的空間直線距離)。
+    - **缺點**：對整體 scale 敏感 (亮度/對比會放大距離)；在 L2 正規化後與 Cosine
+      完全等價，因此 **沒有額外資訊**——我們的數據也證實了兩者準確率相同。
+
+    **3️⃣ Manhattan (L1) 🟠**
+    - **優點**：逐維取絕對值差，對單一維度的極端離群值較不敏感 (robust)；
+      在高維數據中常比 L2 更穩定。
+    - **缺點**：距離值隨維度累加而變大 (尺度與 Cosine/L2 無法直接比較)；對所有維度
+      一視同仁，容易受大量低訊號維度 (雜訊) 影響，導致準確率略降。
+
+    **📌 結論**
+    - 三者在此任務中差距很小 (99–99.4%)，代表 **特徵本身的品質才是主導因素**。
+    - Cosine 與 L2 等價 → 選一個即可 (通常選 Cosine，方便當 similarity)。
+    - Manhattan 在 VGG16 上略勝 (99.38%)，但在 ResNet50/DenseNet121 略輸，
+      顯示它對「不同特徵分布」很敏感，不一定保證更好。
+    """)
