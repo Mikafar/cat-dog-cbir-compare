@@ -37,6 +37,15 @@ Note: on this machine run torch downloads with
 `SSL_CERT_FILE=<venv>/lib/python3.10/site-packages/certifi/cacert.pem` if you hit
 `ssl.SSLCertVerificationError`.
 
+## Deploy to Streamlit Community Cloud
+
+1. Push repo `Mikafar/cat-dog-cbir-compare` to GitHub (already done).
+2. Go to https://share.streamlit.io -> **Create app** -> "Yup, I have an app".
+3. Select repo `Mikafar/cat-dog-cbir-compare`, branch `main`, main file `app.py`.
+4. Optional: set a custom subdomain (e.g. `cat-dog-cbir-compare`).
+5. Deploy. If memory limits hit while loading the 3 encoders, enable
+   **High performance** mode under App Settings -> Resources.
+
 ## Compare
 
 Use `compare_results.pkl` (dict keyed by model name) for further analysis:
